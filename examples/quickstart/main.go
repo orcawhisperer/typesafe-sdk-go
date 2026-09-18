@@ -38,7 +38,7 @@ func main() {
 		State: map[string]any{
 			"document": "I was charged twice. Please fix this ASAP.",
 		},
-		Questions: typesafe.BindQuestions(billingQ, deptQ, urgencyQ),
+		Questions: typesafe.MustBindQuestions(billingQ, deptQ, urgencyQ),
 	})
 	if err != nil {
 		log.Fatalf("SystemOne request failed: %v", err)

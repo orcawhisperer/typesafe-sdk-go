@@ -131,6 +131,9 @@ func (q ChoiceQuestion[T]) validate(name string) error {
 	if q.Criteria == nil {
 		return NewTypeSafeError(fmt.Sprintf("Choice question %q must have a non-nil criteria map.", name))
 	}
+	if len(q.Criteria) == 0 {
+		return NewTypeSafeError(fmt.Sprintf("Choice question %q must define at least one option in criteria.", name))
+	}
 	return nil
 }
 
@@ -275,6 +278,9 @@ func (q RawQuestion) validate(name string) error {
 		if rv.Kind() == reflect.Slice || rv.Kind() == reflect.Array {
 			return NewTypeSafeError("Choice criteria must be a map of labels to descriptions, not a list.")
 		}
+		if rv.Kind() == reflect.Map && rv.Len() == 0 {
+			return NewTypeSafeError(fmt.Sprintf("Choice question %q must define at least one option in criteria.", name))
+		}
 	}
 	return nil
 }
@@ -340,7 +346,8 @@ func (n NamedChoice[T]) Answer(resp *SystemOneResponse) (ChoiceResponse[T], bool
 	return GetChoice[T](resp, n.Name)
 }
 
-// MustAnswer extracts the typed ChoiceResponse[T] from resp, or returns the zero value if missing.
+// MustAnswer extracts the typed ChoiceResponse[T] from resp.
+// Returns the zero value when the answer is missing; use Answer for an explicit (value, ok) check.
 func (n NamedChoice[T]) MustAnswer(resp *SystemOneResponse) ChoiceResponse[T] {
 	ans, _ := GetChoice[T](resp, n.Name)
 	return ans
@@ -368,7 +375,8 @@ func (n NamedScore) Answer(resp *SystemOneResponse) (ScoreResponse, bool) {
 	return GetScore(resp, n.Name)
 }
 
-// MustAnswer extracts the ScoreResponse from resp, or returns the zero value if missing.
+// MustAnswer extracts the ScoreResponse from resp.
+// Returns the zero value when the answer is missing; use Answer for an explicit (value, ok) check.
 func (n NamedScore) MustAnswer(resp *SystemOneResponse) ScoreResponse {
 	ans, _ := GetScore(resp, n.Name)
 	return ans
@@ -396,7 +404,8 @@ func (n NamedNoul) Answer(resp *SystemOneResponse) (NoulResponse, bool) {
 	return GetNoul(resp, n.Name)
 }
 
-// MustAnswer extracts the NoulResponse from resp, or returns the zero value if missing.
+// MustAnswer extracts the NoulResponse from resp.
+// Returns the zero value when the answer is missing; use Answer for an explicit (value, ok) check.
 func (n NamedNoul) MustAnswer(resp *SystemOneResponse) NoulResponse {
 	ans, _ := GetNoul(resp, n.Name)
 	return ans
@@ -404,12 +413,27 @@ func (n NamedNoul) MustAnswer(resp *SystemOneResponse) NoulResponse {
 
 // BindQuestions assembles one or more BoundQuestion handles (NamedChoice[T], NamedScore, NamedNoul)
 // into a heterogeneous Questions map ready for SystemOneRequest.
-func BindQuestions(items ...BoundQuestion) Questions {
+// Returns a *TypeSafeError if any item is nil or if two items share the same question name.
+func BindQuestions(items ...BoundQuestion) (Questions, error) {
 	q := make(Questions, len(items))
 	for _, item := range items {
-		if item != nil {
-			q[item.QuestionName()] = item.QuestionValue()
+		if item == nil {
+			return nil, NewTypeSafeError("BindQuestions received a nil BoundQuestion.")
 		}
+		name := item.QuestionName()
+		if _, exists := q[name]; exists {
+			return nil, NewTypeSafeError(fmt.Sprintf("BindQuestions has duplicate question name %q.", name))
+		}
+		q[name] = item.QuestionValue()
+	}
+	return q, nil
+}
+
+// MustBindQuestions is like BindQuestions but panics if binding fails.
+func MustBindQuestions(items ...BoundQuestion) Questions {
+	q, err := BindQuestions(items...)
+	if err != nil {
+		panic(err)
 	}
 	return q
 }

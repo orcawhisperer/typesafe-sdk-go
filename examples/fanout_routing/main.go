@@ -34,7 +34,7 @@ func main() {
 	// Speculative fan-out: send all questions in a single round-trip and let Go code decide what is relevant.
 	resp, err := client.SystemOne(context.Background(), typesafe.SystemOneRequest{
 		State:     "Order #INV-90210 charged my card twice! Please refund the duplicate charge immediately.",
-		Questions: typesafe.BindQuestions(intentQ, hasOrderIDQ, severityQ),
+		Questions: typesafe.MustBindQuestions(intentQ, hasOrderIDQ, severityQ),
 	})
 	if err != nil {
 		log.Fatalf("Evaluation failed: %v", err)

@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,11 +177,15 @@ func TestSystemOne_PrimitivesGenericsAndHeaders(t *testing.T) {
 	})
 	frustQ := typesafe.DefineScore("frustration", "How frustrated is the customer?", "Calm", "Frustrated", "Very angry")
 
+	questions, err := typesafe.BindQuestions(urgentQ, deptQ, frustQ)
+	if err != nil {
+		t.Fatalf("BindQuestions failed: %v", err)
+	}
 	withResp, err := client.SystemOneWithResponse(
 		context.Background(),
 		typesafe.SystemOneRequest{
 			State:     map[string]any{"document": "Help! My payouts have been failing for 3 days."},
-			Questions: typesafe.BindQuestions(urgentQ, deptQ, frustQ),
+			Questions: questions,
 		},
 		typesafe.WithExtraHeaders(map[string]string{"X-Request-Trace": "trace-42"}),
 		typesafe.WithExtraBody(map[string]any{"beam_width": 4}),
@@ -247,6 +253,30 @@ func TestSystemOne_PrimitivesGenericsAndHeaders(t *testing.T) {
 	}
 }
 
+func TestBindQuestions_NilAndDuplicateNames(t *testing.T) {
+	q1 := typesafe.DefineNoul("billing", "Is this about billing?")
+	q2 := typesafe.DefineScore("urgency", "How urgent?", "low", "high")
+
+	_, err := typesafe.BindQuestions(q1, nil)
+	if err == nil || !strings.Contains(err.Error(), "nil BoundQuestion") {
+		t.Fatalf("expected nil BoundQuestion error, got %v", err)
+	}
+
+	dup := typesafe.DefineNoul("billing", "Duplicate name")
+	_, err = typesafe.BindQuestions(q1, dup)
+	if err == nil || !strings.Contains(err.Error(), "duplicate question name") {
+		t.Fatalf("expected duplicate name error, got %v", err)
+	}
+
+	bound, err := typesafe.BindQuestions(q1, q2)
+	if err != nil {
+		t.Fatalf("unexpected BindQuestions error: %v", err)
+	}
+	if len(bound) != 2 {
+		t.Fatalf("expected 2 questions, got %d", len(bound))
+	}
+}
+
 func TestValidateQuestions_ClientSideRejection(t *testing.T) {
 	client := typesafe.MustNewClient(typesafe.WithAPIKey("test-key-123456789"))
 
@@ -274,6 +304,14 @@ func TestValidateQuestions_ClientSideRejection(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "not a list") {
 		t.Fatalf("expected non-list score criteria error, got %v", err)
+	}
+
+	// 4. Choice question with empty criteria map
+	_, err = client.Ask(context.Background(), "hello", typesafe.Questions{
+		"bad_choice": typesafe.Choice("Pick one", map[Department]typesafe.Description{}),
+	})
+	if err == nil || !strings.Contains(err.Error(), "at least one option") {
+		t.Fatalf("expected empty choice criteria error, got %v", err)
 	}
 }
 
@@ -522,5 +560,129 @@ func TestRedactHeaders_AndArchitecturalPatterns(t *testing.T) {
 	// Total = 0.375 + 0.300 + 0.190 = 0.865
 	if comp.WeightedScore < 0.864 || comp.WeightedScore > 0.866 || comp.MinConfidence != 0.80 {
 		t.Errorf("unexpected composite score: %+v", comp)
+	}
+}
+
+func TestBatchSystemOne_OrderConcurrencyAndPartialFailure(t *testing.T) {
+	var mu sync.Mutex
+	active := 0
+	maxActive := 0
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var payload struct {
+			State map[string]any `json:"state"`
+		}
+		_ = json.Unmarshal(raw, &payload)
+		idx, _ := payload.State["idx"].(float64)
+
+		mu.Lock()
+		active++
+		if active > maxActive {
+			maxActive = active
+		}
+		mu.Unlock()
+
+		time.Sleep(30 * time.Millisecond)
+
+		mu.Lock()
+		active--
+		mu.Unlock()
+
+		if int(idx) == 1 {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"bad request"}`))
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(fmt.Sprintf(`{
+			"model": "jev-1.13.0",
+			"answers": {"q": {"type": "noul", "noul": %.2f}},
+			"usage": {"input_tokens": 1, "output_tokens": 1}
+		}`, idx*0.1)))
+	}))
+	defer srv.Close()
+
+	client := typesafe.MustNewClient(
+		typesafe.WithAPIKey("test-key-123456789"),
+		typesafe.WithBaseURL(srv.URL),
+		typesafe.WithMaxRetries(0),
+	)
+
+	makeReq := func(idx int) typesafe.SystemOneRequest {
+		return typesafe.SystemOneRequest{
+			State:     map[string]any{"idx": idx},
+			Questions: typesafe.Questions{"q": typesafe.Noul("?")},
+		}
+	}
+
+	requests := []typesafe.SystemOneRequest{
+		makeReq(0),
+		makeReq(1),
+		makeReq(2),
+		makeReq(3),
+	}
+
+	results := client.BatchSystemOne(context.Background(), requests, 2)
+	if len(results) != 4 {
+		t.Fatalf("expected 4 results, got %d", len(results))
+	}
+	if maxActive > 2 {
+		t.Errorf("expected concurrency capped at 2, saw maxActive=%d", maxActive)
+	}
+
+	if results[0].Err != nil || results[0].Response.Nouls["q"].Noul != 0.0 {
+		t.Errorf("index 0: expected success with noul=0.0, got err=%v resp=%+v", results[0].Err, results[0].Response)
+	}
+	var badReq *typesafe.BadRequestError
+	if !errors.As(results[1].Err, &badReq) {
+		t.Errorf("index 1: expected *BadRequestError, got %v", results[1].Err)
+	}
+	if results[2].Err != nil || results[2].Response.Nouls["q"].Noul != 0.2 {
+		t.Errorf("index 2: expected success with noul=0.2, got err=%v", results[2].Err)
+	}
+	if results[3].Err != nil || results[3].Response.Nouls["q"].Noul != 0.3 {
+		t.Errorf("index 3: expected success with noul=0.3, got err=%v", results[3].Err)
+	}
+	for i, r := range results {
+		if r.Index != i {
+			t.Errorf("result[%d].Index = %d, want %d", i, r.Index, i)
+		}
+	}
+}
+
+func TestBatchSystemOne_ContextCancellation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"model":"jev-1.13.0","answers":{"q":{"type":"noul","noul":1}},"usage":{}}`))
+	}))
+	defer srv.Close()
+
+	client := typesafe.MustNewClient(
+		typesafe.WithAPIKey("test-key-123456789"),
+		typesafe.WithBaseURL(srv.URL),
+		typesafe.WithTimeout(5*time.Second),
+		typesafe.WithMaxRetries(0),
+	)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+
+	requests := []typesafe.SystemOneRequest{
+		{State: "a", Questions: typesafe.Questions{"q": typesafe.Noul("?")}},
+		{State: "b", Questions: typesafe.Questions{"q": typesafe.Noul("?")}},
+	}
+
+	results := client.BatchSystemOne(ctx, requests, 2)
+	for i, r := range results {
+		var abortErr *typesafe.APIUserAbortError
+		if !errors.As(r.Err, &abortErr) {
+			t.Errorf("result[%d]: expected *APIUserAbortError, got %v", i, r.Err)
+		}
 	}
 }

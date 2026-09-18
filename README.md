@@ -61,7 +61,7 @@ func main() {
 
 	resp, err := client.SystemOne(context.Background(), typesafe.SystemOneRequest{
 		State:     map[string]any{"document": "I was charged twice. Please fix this ASAP."},
-		Questions: typesafe.BindQuestions(billingQ, toneQ, urgencyQ),
+		Questions: typesafe.MustBindQuestions(billingQ, toneQ, urgencyQ),
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -73,6 +73,14 @@ func main() {
 }
 ```
 
+See also the runnable examples under [`examples/`](examples/):
+
+| Example | Demonstrates |
+|---|---|
+| [`examples/quickstart`](examples/quickstart/main.go) | Typed questions, `SystemOne`, bound answer extraction |
+| [`examples/fanout_routing`](examples/fanout_routing/main.go) | Speculative fan-out + confidence-gated routing |
+| [`examples/composite_score`](examples/composite_score/main.go) | Weighted composite scoring across score/noul answers |
+
 ---
 
 ## Environment Variables & Defaults
@@ -83,3 +91,158 @@ func main() {
 | `TYPESAFE_BASE_URL` | API root URL | `https://api.typesafe.ai` |
 | `TYPESAFE_DEFAULT_MODEL` | Default model | `jev-latest` |
 | `TYPESAFE_LOG_LEVEL` | SDK logger verbosity (`debug`, `info`, `warn`, `error`, `off`) | `warn` |
+
+Explicit `ClientOption` values always override environment variables.
+
+---
+
+## Client Configuration
+
+```go
+client, err := typesafe.NewClient(
+	typesafe.WithAPIKey("ts_..."),
+	typesafe.WithBaseURL("https://api.typesafe.ai"),
+	typesafe.WithDefaultModel(typesafe.ModelJevLatest),
+	typesafe.WithTimeout(30*time.Second),
+	typesafe.WithMaxRetries(3),
+	typesafe.WithLogLevel(typesafe.LogLevelInfo),
+	typesafe.WithDefaultHeaders(map[string]string{"X-App": "my-service"}),
+)
+```
+
+Per-request overrides:
+
+```go
+resp, err := client.SystemOne(ctx, req,
+	typesafe.WithRequestModel("jev-1.13.0"),
+	typesafe.WithRequestTimeout(60*time.Second),
+	typesafe.WithExtraBody(map[string]any{"beam_width": 4}),
+)
+```
+
+---
+
+## Binding Questions
+
+Use `BindQuestions` to assemble typed question handles into a `Questions` map. It returns an error for nil items or duplicate names:
+
+```go
+questions, err := typesafe.BindQuestions(billingQ, toneQ, urgencyQ)
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+`MustBindQuestions` panics on binding errors (convenient in examples and init code).
+
+### Answer extraction
+
+- `deptQ.Answer(resp)` returns `(ChoiceResponse[T], bool)` — preferred when a missing answer is unexpected.
+- `deptQ.MustAnswer(resp)` returns the zero value when the answer is missing (no panic).
+
+---
+
+## Error Handling
+
+All SDK errors unwrap to `*TypeSafeError`. HTTP failures expose typed status errors:
+
+```go
+resp, err := client.SystemOne(ctx, req)
+if err != nil {
+	var rateLimit *typesafe.RateLimitError
+	if errors.As(err, &rateLimit) {
+		time.Sleep(rateLimit.RetryAfter)
+		// retry...
+	}
+	var auth *typesafe.AuthenticationError
+	if errors.As(err, &auth) {
+		log.Fatalf("invalid API key (request %s)", auth.RequestID)
+	}
+	var valErr *typesafe.APIResponseValidationError
+	if errors.As(err, &valErr) {
+		log.Fatalf("bad response at %s: %v", valErr.FieldPath, valErr)
+	}
+	log.Fatal(err)
+}
+```
+
+Context cancellation returns `*APIUserAbortError`. Per-attempt timeouts return `*APITimeoutError`.
+
+---
+
+## Retry Policy
+
+Default policy: 2 retries, 500ms initial backoff (capped at 5s), 25% subtractive jitter, honors `retry-after-ms` / `Retry-After` up to 60s.
+
+```go
+policy := typesafe.DefaultRetryPolicy()
+policy.MaxRetries = 5
+policy.TotalTimeout = 2 * time.Minute
+
+client, err := typesafe.NewClient(
+	typesafe.WithAPIKey("ts_..."),
+	typesafe.WithRetryPolicy(policy),
+)
+```
+
+Disable retries with `typesafe.WithMaxRetries(0)`.
+
+> **Note:** `LogLevelDebug` logs full request bodies including `state` content. Use `warn` or higher in production when state may contain sensitive data.
+
+---
+
+## Models API
+
+```go
+models, err := client.Models.List(ctx)
+if err != nil {
+	log.Fatal(err)
+}
+for _, m := range models.Models {
+	fmt.Println(m.Name, m.Description)
+}
+```
+
+---
+
+## Architectural Patterns
+
+### Confidence-gated routing
+
+```go
+decision := typesafe.RouteChoice(toneQ.MustAnswer(resp), 0.80, 0.50)
+switch decision.Action {
+case typesafe.GateActionAct:
+	// auto-act on decision.Answer
+case typesafe.GateActionReview:
+	// route to human review
+case typesafe.GateActionAbstain:
+	// fall back
+}
+```
+
+Also available: `RouteScore`, `RouteNoul`.
+
+### Composite scoring
+
+```go
+composite, err := typesafe.ComputeCompositeScore(resp, []typesafe.ScoreDimension{
+	{Name: "severity", Weight: 0.5, MaxScore: 2.0},
+	{Name: "is_security", Weight: 0.5},
+})
+```
+
+### Concurrent batch evaluation
+
+```go
+results := client.BatchSystemOne(ctx, []typesafe.SystemOneRequest{req1, req2, req3}, 8)
+for _, r := range results {
+	if r.Err != nil {
+		log.Printf("item %d failed: %v", r.Index, r.Err)
+		continue
+	}
+	// use r.Response
+}
+```
+
+Results preserve input order. Partial failures do not abort the batch.
